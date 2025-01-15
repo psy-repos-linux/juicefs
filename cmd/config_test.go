@@ -25,6 +25,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 )
 
+//mutate_test_job_number: 3
 func getStdout(args []string) ([]byte, error) {
 	tmp, err := os.CreateTemp("/tmp", "jfstest-*")
 	if err != nil {
@@ -43,7 +44,9 @@ func getStdout(args []string) ([]byte, error) {
 
 func TestConfig(t *testing.T) {
 	_ = resetTestMeta()
-	if err := Main([]string{"", "format", testMeta, "--bucket", "/tmp/testBucket", testVolume}); err != nil {
+	bucketPath := "/tmp/testBucket"
+	_ = os.RemoveAll(bucketPath)
+	if err := Main([]string{"", "format", testMeta, "--bucket", bucketPath, testVolume}); err != nil {
 		t.Fatalf("format: %s", err)
 	}
 
@@ -65,7 +68,7 @@ func TestConfig(t *testing.T) {
 	if err = Main([]string{"", "config", testMeta, "--capacity", "10", "--inodes", "1000000"}); err != nil {
 		t.Fatalf("config: %s", err)
 	}
-	if err = Main([]string{"", "config", testMeta, "--bucket", "/tmp/newBucket", "--access-key", "testAK", "--secret-key", "testSK"}); err != nil {
+	if err = Main([]string{"", "config", testMeta, "--bucket", "/tmp/newBucket", "--access-key", "testAK", "--secret-key", "testSK", "--session-token", "token"}); err != nil {
 		t.Fatalf("config: %s", err)
 	}
 	if data, err = getStdout([]string{"", "config", testMeta}); err != nil {
@@ -75,7 +78,7 @@ func TestConfig(t *testing.T) {
 		t.Fatalf("json unmarshal: %s", err)
 	}
 	if format.Capacity != 10<<30 || format.Inodes != 1000000 ||
-		format.Bucket != "/tmp/newBucket/" || format.AccessKey != "testAK" || format.SecretKey != "removed" {
+		format.Bucket != "/tmp/newBucket/" || format.AccessKey != "testAK" || format.SecretKey != "removed" || format.SessionToken != "removed" {
 		t.Fatalf("unexpect format: %+v", format)
 	}
 }

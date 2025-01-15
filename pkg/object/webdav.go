@@ -20,16 +20,16 @@
 package object
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"sort"
 	"strings"
 
-	gowebdav "github.com/emersion/go-webdav"
+	"github.com/studio-b12/gowebdav"
 )
 
 type webdav struct {
@@ -49,22 +49,48 @@ func (w *webdav) Create() error {
 func (w *webdav) Head(key string) (Object, error) {
 	info, err := w.c.Stat(key)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+		if gowebdav.IsErrNotFound(err) {
 			err = os.ErrNotExist
 		}
 		return nil, err
 	}
 	return &obj{
 		key,
-		info.Size,
-		info.ModTime,
-		strings.HasSuffix(key, "/"),
+		info.Size(),
+		info.ModTime(),
+		info.IsDir(),
+		"",
 	}, nil
 }
 
-func (w *webdav) Get(key string, off, limit int64) (io.ReadCloser, error) {
+// limitedReadCloser wraps a io.ReadCloser and limits the number of bytes that can be read from it.
+type limitedReadCloser struct {
+	rc        io.ReadCloser
+	remaining int
+}
+
+func (l *limitedReadCloser) Read(buf []byte) (int, error) {
+	if l.remaining <= 0 {
+		return 0, io.EOF
+	}
+
+	if len(buf) > l.remaining {
+		buf = buf[0:l.remaining]
+	}
+
+	n, err := l.rc.Read(buf)
+	l.remaining -= n
+
+	return n, err
+}
+
+func (l *limitedReadCloser) Close() error {
+	return l.rc.Close()
+}
+
+func (w *webdav) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	if off == 0 && limit <= 0 {
-		return w.c.Open(key)
+		return w.c.ReadStream(key)
 	}
 	url := &url.URL{
 		Scheme: w.endpoint.Scheme,
@@ -85,108 +111,127 @@ func (w *webdav) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != 200 && resp.StatusCode != 206 {
-		return nil, parseError(resp)
+	if resp.StatusCode == http.StatusPartialContent {
+		// server supported partial content, return as-is.
+		return resp.Body, nil
 	}
-	return resp.Body, nil
-}
 
-func (w *webdav) mkdirs(p string) error {
-	err := w.c.Mkdir(p)
-	if err != nil && w.isNotExist(path.Dir(p)) {
-		if w.mkdirs(path.Dir(p)) == nil {
-			err = w.c.Mkdir(p)
+	// server returned success, but did not support partial content, so we have the whole
+	// stream in rs.Body
+	if resp.StatusCode == 200 {
+		if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, off)); err != nil {
+			return nil, &os.PathError{Op: "ReadStreamRange", Path: key, Err: err}
 		}
+		// return a io.ReadCloser that is limited to `length` bytes.
+		return &limitedReadCloser{resp.Body, int(limit)}, nil
 	}
-	return err
+	_ = resp.Body.Close()
+	return nil, &os.PathError{Op: "ReadStreamRange", Path: key, Err: err}
 }
 
-func (w *webdav) isNotExist(key string) bool {
-	if _, err := w.c.Stat(key); err != nil {
-		return strings.Contains(strings.ToLower(err.Error()), "not found")
+func (w *webdav) Put(key string, in io.Reader, getters ...AttrGetter) error {
+	if key == "" {
+		return nil
 	}
-	return false
+	if strings.HasSuffix(key, dirSuffix) {
+		return w.c.MkdirAll(key, 0)
+	}
+	return w.c.WriteStream(key, in, 0)
 }
 
-func (w *webdav) path(key string) string {
-	return "/" + key
-}
-
-func (w *webdav) Put(key string, in io.Reader) error {
-	p := w.path(key)
-	if strings.HasSuffix(key, dirSuffix) || key == "" && strings.HasSuffix(w.endpoint.Path, dirSuffix) {
-		return w.mkdirs(p)
+func (w *webdav) Delete(key string, getters ...AttrGetter) error {
+	info, err := w.c.Stat(key)
+	if gowebdav.IsErrNotFound(err) {
+		return nil
 	}
-	var buf = bytes.NewBuffer(nil)
-	in = io.TeeReader(in, buf)
-	out, err := w.c.Create(key)
 	if err != nil {
 		return err
 	}
-	wbuf := bufPool.Get().(*[]byte)
-	defer bufPool.Put(wbuf)
-	_, err = io.CopyBuffer(out, in, *wbuf)
-	if err != nil {
-		return err
-	}
-	err = out.Close()
-	if err != nil && w.isNotExist(path.Dir(key)) {
-		if w.mkdirs(path.Dir(key)) == nil {
-			return w.Put(key, bytes.NewReader(buf.Bytes()))
+	if info.IsDir() {
+		infos, err := w.c.ReadDir(key)
+		if err != nil {
+			if gowebdav.IsErrNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if len(infos) != 0 {
+			return fmt.Errorf("%s is non-empty directory", key)
 		}
 	}
-	return err
-}
-
-func (w *webdav) Delete(key string) error {
-	err := w.c.RemoveAll(key)
-	if err != nil && w.isNotExist(key) {
-		err = nil
-	}
-	return err
+	return w.c.Remove(key)
 }
 
 func (w *webdav) Copy(dst, src string) error {
-	return w.c.CopyAll(src, dst, true)
+	return w.c.Copy(src, dst, true)
 }
 
-func (w *webdav) ListAll(prefix, marker string) (<-chan Object, error) {
-	listed := make(chan Object, 10240)
-	var walkRoot string
-	if strings.HasSuffix(prefix, dirSuffix) {
-		walkRoot = prefix
-	} else {
+type webDAVFile struct {
+	os.FileInfo
+	name string
+}
+
+func (w webDAVFile) Name() string {
+	return w.name
+}
+
+func (w *webdav) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	if delimiter != "/" {
+		return nil, false, "", notSupported
+	}
+
+	root := "/" + prefix
+	var objs []Object
+	if !strings.HasSuffix(root, dirSuffix) {
 		// If the root is not ends with `/`, we'll list the directory root resides.
-		walkRoot = path.Dir(prefix)
+		root = path.Dir(root)
+		if !strings.HasSuffix(root, dirSuffix) {
+			root += dirSuffix
+		}
 	}
-	infos, err := w.c.Readdir(walkRoot, true)
+
+	infos, err := w.c.ReadDir(root)
 	if err != nil {
-		if strings.Contains(err.Error(), "404") {
-			close(listed)
-			return listed, nil
+		if gowebdav.IsErrCode(err, http.StatusForbidden) {
+			logger.Warnf("skip %s: %s", root, err)
+			return nil, false, "", nil
 		}
-		return nil, err
+		if gowebdav.IsErrNotFound(err) {
+			return nil, false, "", nil
+		}
+		return nil, false, "", err
 	}
-	go func() {
-		for _, info := range infos {
-			key := info.Path[len(w.endpoint.Path):]
-			if info.IsDir || !strings.HasPrefix(key, prefix) || (marker != "" && key <= marker) {
-				continue
-			}
-			o := &obj{
-				key,
-				info.Size,
-				info.ModTime,
-				info.IsDir,
-			}
-			listed <- o
+	sortedInfos := make([]os.FileInfo, len(infos))
+	for idx, o := range infos {
+		if o.IsDir() {
+			sortedInfos[idx] = &webDAVFile{name: o.Name() + dirSuffix, FileInfo: o}
+		} else {
+			sortedInfos[idx] = o
 		}
-		close(listed)
-	}()
-	return listed, nil
+	}
+	sort.Slice(sortedInfos, func(i, j int) bool {
+		return sortedInfos[i].Name() < sortedInfos[j].Name()
+	})
+	for _, info := range sortedInfos {
+		key := root[1:] + info.Name()
+		if !strings.HasPrefix(key, prefix) || (marker != "" && key <= marker) {
+			continue
+		}
+		objs = append(objs, &obj{
+			key,
+			info.Size(),
+			info.ModTime(),
+			info.IsDir(),
+			"",
+		})
+		if len(objs) == int(limit) {
+			break
+		}
+	}
+	return generateListResult(objs, limit)
 }
 
-func newWebDAV(endpoint, user, passwd string) (ObjectStorage, error) {
+func newWebDAV(endpoint, user, passwd, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
 		endpoint = fmt.Sprintf("http://%s", endpoint)
 	}
@@ -198,10 +243,8 @@ func newWebDAV(endpoint, user, passwd string) (ObjectStorage, error) {
 		uri.Path = "/"
 	}
 	uri.User = url.UserPassword(user, passwd)
-	c, err := gowebdav.NewClient(httpClient, uri.String())
-	if err != nil {
-		return nil, fmt.Errorf("create client for %s: %s", uri, err)
-	}
+	c := gowebdav.NewClient(uri.String(), user, passwd)
+	c.SetTransport(httpClient.Transport)
 	return &webdav{endpoint: uri, c: c}, nil
 }
 

@@ -38,7 +38,11 @@ func (s *wasabi) String() string {
 	return fmt.Sprintf("wasabi://%s/", s.s3client.bucket)
 }
 
-func newWasabi(endpoint, accessKey, secretKey string) (ObjectStorage, error) {
+func (s *wasabi) SetStorageClass(_ string) error {
+	return notSupported
+}
+
+func newWasabi(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
 		endpoint = fmt.Sprintf("https://%s", endpoint)
 	}
@@ -58,7 +62,7 @@ func newWasabi(endpoint, accessKey, secretKey string) (ObjectStorage, error) {
 		DisableSSL:       aws.Bool(!ssl),
 		S3ForcePathStyle: aws.Bool(false),
 		HTTPClient:       httpClient,
-		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, ""),
+		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, token),
 	}
 
 	ses, err := session.NewSession(awsConfig)
@@ -66,7 +70,7 @@ func newWasabi(endpoint, accessKey, secretKey string) (ObjectStorage, error) {
 		return nil, fmt.Errorf("aws session: %s", err)
 	}
 	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &wasabi{s3client{bucket, s3.New(ses), ses}}, nil
+	return &wasabi{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
 }
 
 func init() {
