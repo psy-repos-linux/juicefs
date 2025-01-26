@@ -30,12 +30,11 @@ func TestCompact(t *testing.T) {
 		BlockSize:  256 * 1024,
 		Compress:   "lz4",
 		MaxUpload:  2,
-		MaxDeletes: 1,
 		BufferSize: 30 << 20,
-		CacheSize:  10,
+		CacheSize:  10 << 20,
 		CacheDir:   "memory",
 	}
-	blob, _ := object.CreateStorage("mem", "", "", "")
+	blob, _ := object.CreateStorage("mem", "", "", "", "")
 	store := chunk.NewCachedStore(blob, cconf, nil)
 
 	// prepare the slices
@@ -56,7 +55,7 @@ func TestCompact(t *testing.T) {
 		if e := w.Finish(len(buf)); e != nil {
 			t.Fatalf("flush chunk %d: %s", cid, e)
 		}
-		slices = append(slices, meta.Slice{Chunkid: cid, Size: uint32(len(buf)), Len: uint32(len(buf))})
+		slices = append(slices, meta.Slice{Id: cid, Size: uint32(len(buf)), Len: uint32(len(buf))})
 	}
 
 	// compact

@@ -39,7 +39,17 @@ func (s *scw) String() string {
 	return fmt.Sprintf("scw://%s/", s.s3client.bucket)
 }
 
-func newScw(endpoint, accessKey, secretKey string) (ObjectStorage, error) {
+func (s *scw) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              5 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             1000,
+	}
+}
+
+func newScw(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
 		endpoint = fmt.Sprintf("https://%s", endpoint)
 	}
@@ -66,7 +76,7 @@ func newScw(endpoint, accessKey, secretKey string) (ObjectStorage, error) {
 		DisableSSL:       aws.Bool(!ssl),
 		S3ForcePathStyle: aws.Bool(false),
 		HTTPClient:       httpClient,
-		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, ""),
+		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, token),
 	}
 
 	ses, err := session.NewSession(awsConfig)
@@ -74,7 +84,7 @@ func newScw(endpoint, accessKey, secretKey string) (ObjectStorage, error) {
 		return nil, fmt.Errorf("aws session: %s", err)
 	}
 	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &scw{s3client{bucket, s3.New(ses), ses}}, nil
+	return &scw{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
 }
 
 func init() {
