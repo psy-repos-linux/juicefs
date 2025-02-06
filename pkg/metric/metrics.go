@@ -25,8 +25,6 @@ import (
 
 	consulapi "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/go-hclog"
-
-	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -55,38 +53,18 @@ var (
 	}, func() float64 {
 		return time.Since(start).Seconds()
 	})
-	usedSpace = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "used_space",
-		Help: "Total used space in bytes.",
-	})
-	usedInodes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "used_inodes",
-		Help: "Total number of inodes.",
-	})
 )
 
-func UpdateMetrics(m meta.Meta, registerer prometheus.Registerer) {
+func UpdateMetrics(registerer prometheus.Registerer) {
 	if registerer == nil {
 		return
 	}
 	registerer.MustRegister(cpu)
 	registerer.MustRegister(memory)
 	registerer.MustRegister(uptime)
-	registerer.MustRegister(usedSpace)
-	registerer.MustRegister(usedInodes)
-
-	for {
-		var totalSpace, availSpace, iused, iavail uint64
-		err := m.StatFS(meta.Background, &totalSpace, &availSpace, &iused, &iavail)
-		if err == 0 {
-			usedSpace.Set(float64(totalSpace - availSpace))
-			usedInodes.Set(float64(iused))
-		}
-		utils.SleepWithJitter(time.Second * 10)
-	}
 }
 
-func RegisterToConsul(consulAddr, metricsAddr, mountPoint string) {
+func RegisterToConsul(consulAddr, metricsAddr string, metadata map[string]string) {
 	if metricsAddr == "" {
 		logger.Errorf("Metrics server start err,so can't register to consul")
 		return
@@ -121,14 +99,23 @@ func RegisterToConsul(consulAddr, metricsAddr, mountPoint string) {
 		return
 	}
 
-	localMeta := make(map[string]string)
 	hostname, err := os.Hostname()
 	if err != nil {
 		logger.Errorf("Get hostname failed:%s", err)
 		return
 	}
-	localMeta["hostName"] = hostname
-	localMeta["mountPoint"] = mountPoint
+	metadata["hostName"] = hostname
+	var id, name string
+	if mp, ok := metadata["mountPoint"]; ok {
+		id = fmt.Sprintf("%s:%s", localIp, mp)
+		name = "juicefs"
+	} else {
+		// for sync metrics, id format: 127.0.0.1;src->dst;pid=6666
+		id = fmt.Sprintf("%s;%s->%s;pid=%s", localIp, metadata["src"], metadata["dst"], metadata["pid"])
+		delete(metadata, "src")
+		delete(metadata, "dst")
+		name = "juicefs-sync"
+	}
 
 	check := &consulapi.AgentServiceCheck{
 		HTTP:                           fmt.Sprintf("http://%s:%d/metrics", localIp, port),
@@ -138,16 +125,16 @@ func RegisterToConsul(consulAddr, metricsAddr, mountPoint string) {
 	}
 
 	registration := consulapi.AgentServiceRegistration{
-		ID:      fmt.Sprintf("%s:%s", localIp, mountPoint),
-		Name:    "juicefs",
+		ID:      id,
+		Name:    name,
 		Port:    port,
 		Address: localIp,
-		Meta:    localMeta,
+		Meta:    metadata,
 		Check:   check,
 	}
 	if err = client.Agent().ServiceRegister(&registration); err != nil {
-		logger.Errorf("Service register failed:%s", err)
+		logger.Errorf("Service register failed: %s", err)
 	} else {
-		logger.Info("Juicefs register to consul success")
+		logger.Infof("Juicefs register to consul success, id: %q, port: %d", id, port)
 	}
 }

@@ -34,55 +34,125 @@ type _file struct {
 	size uint64
 }
 
-func (v *VFS) fillCache(paths []string, concurrent int, count, bytes *uint64) {
-	logger.Infof("start to warmup %d paths with %d workers", len(paths), concurrent)
+type CacheAction uint8
+
+func (act CacheAction) String() string {
+	switch act {
+	case WarmupCache:
+		return "warmup cache"
+	case EvictCache:
+		return "evict cache"
+	case CheckCache:
+		return "check cache"
+	}
+	return "unknown operation"
+}
+
+const (
+	WarmupCache CacheAction = iota
+	EvictCache
+	CheckCache = 2
+)
+
+func (v *VFS) cache(ctx meta.Context, action CacheAction, paths []string, concurrent int, resp *CacheResponse) {
+	logger.Infof("start to %s %d paths with %d workers", action, len(paths), concurrent)
+
+	if resp == nil {
+		resp = &CacheResponse{}
+	}
 	start := time.Now()
-	todo := make(chan _file, 10240)
+	todo := make(chan _file, 10*concurrent)
 	wg := sync.WaitGroup{}
 	for i := 0; i < concurrent; i++ {
 		wg.Add(1)
 		go func() {
-			for {
-				f := <-todo
+			defer wg.Done()
+			for f := range todo {
+				if ctx.Canceled() {
+					return
+				}
+
 				if f.ino == 0 {
-					break
+					logger.Warnf("%s got inode 0", action)
+					continue
 				}
-				if err := v.fillInode(f.ino, f.size); err == nil {
-					if count != nil {
-						atomic.AddUint64(count, 1)
+
+				iter := newSliceIterator(ctx, v.Meta, f.ino, f.size, resp)
+				var handler sliceHandler
+				switch action {
+				case WarmupCache:
+					handler = func(s meta.Slice) error {
+						return v.Store.FillCache(s.Id, s.Size)
 					}
-					if bytes != nil {
-						atomic.AddUint64(bytes, f.size)
+
+					if v.Conf.Meta.OpenCache > 0 {
+						if err := v.Meta.Open(ctx, f.ino, syscall.O_RDONLY, &meta.Attr{}); err != 0 {
+							logger.Errorf("Inode %d could be opened: %s", f.ino, err)
+						}
+						_ = v.Meta.Close(ctx, f.ino)
 					}
-				} else { // TODO: print path instead of inode
-					logger.Errorf("Inode %d could be corrupted: %s", f.ino, err)
+				case EvictCache:
+					handler = func(s meta.Slice) error {
+						return v.Store.EvictCache(s.Id, s.Size)
+					}
+				case CheckCache:
+					handler = func(s meta.Slice) error {
+						missBytes, err := v.Store.CheckCache(s.Id, s.Size)
+						if err != nil {
+							return err
+						}
+						atomic.AddUint64(&resp.MissBytes, missBytes)
+						return nil
+					}
 				}
+
+				// log and skip error
+				err := iter.Iterate(handler)
+				if err != nil {
+					logger.Errorf("%s error : %s", action, err)
+				}
+
+				atomic.AddUint64(&resp.FileCount, 1)
 			}
-			wg.Done()
 		}()
 	}
 
 	var inode Ino
 	var attr = &Attr{}
 	for _, p := range paths {
-		if st := v.resolve(p, &inode, attr); st != 0 {
+		if st := v.resolve(ctx, p, &inode, attr); st != 0 {
 			logger.Warnf("Failed to resolve path %s: %s", p, st)
 			continue
 		}
 		logger.Debugf("Warming up path %s", p)
 		if attr.Typ == meta.TypeDirectory {
-			v.walkDir(inode, todo)
+			v.walkDir(ctx, inode, todo)
 		} else if attr.Typ == meta.TypeFile {
-			todo <- _file{inode, attr.Length}
+			_ = sendFile(ctx, todo, _file{inode, attr.Length})
+		}
+		if ctx.Canceled() {
+			break
 		}
 	}
 	close(todo)
 	wg.Wait()
-	logger.Infof("Warmup %d paths in %s", len(paths), time.Since(start))
+
+	if ctx.Canceled() {
+		logger.Infof("%s cancelled", action)
+	}
+	logger.Infof("%s %d paths in %s", action, len(paths), time.Since(start))
 }
 
-func (v *VFS) resolve(p string, inode *Ino, attr *Attr) syscall.Errno {
-	ctx := meta.Background
+func sendFile(ctx meta.Context, todo chan _file, f _file) error {
+	select {
+	case todo <- f:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (v *VFS) resolve(ctx meta.Context, p string, inode *Ino, attr *Attr) syscall.Errno {
 	var inodePrefix = "inode:"
 	if strings.HasPrefix(p, inodePrefix) {
 		i, err := strconv.ParseUint(p[len(inodePrefix):], 10, 64)
@@ -105,7 +175,7 @@ func (v *VFS) resolve(p string, inode *Ino, attr *Attr) syscall.Errno {
 		if len(name) == 0 {
 			continue
 		}
-		if parent == 1 && i == len(ss)-1 && IsSpecialName(name) {
+		if parent == meta.RootInode && i == len(ss)-1 && IsSpecialName(name) {
 			*inode, attr = GetInternalNodeByName(name)
 			parent = *inode
 			break
@@ -115,7 +185,7 @@ func (v *VFS) resolve(p string, inode *Ino, attr *Attr) syscall.Errno {
 				return err
 			}
 		}
-		if err = v.Meta.Lookup(ctx, parent, name, inode, attr); err != 0 {
+		if err = v.Meta.Lookup(ctx, parent, name, inode, attr, false); err != 0 {
 			return err
 		}
 		if attr.Typ == meta.TypeSymlink {
@@ -128,13 +198,13 @@ func (v *VFS) resolve(p string, inode *Ino, attr *Attr) syscall.Errno {
 				return syscall.ENOTSUP
 			}
 			target = path.Join(strings.Join(ss[:i], "/"), target)
-			if err = v.resolve(target, inode, attr); err != 0 {
+			if err = v.resolve(ctx, target, inode, attr); err != 0 {
 				return err
 			}
 		}
 		parent = *inode
 	}
-	if parent == 1 {
+	if parent == meta.RootInode {
 		*inode = parent
 		if err = v.Meta.GetAttr(ctx, *inode, attr); err != 0 {
 			return err
@@ -143,7 +213,7 @@ func (v *VFS) resolve(p string, inode *Ino, attr *Attr) syscall.Errno {
 	return 0
 }
 
-func (v *VFS) walkDir(inode Ino, todo chan _file) {
+func (v *VFS) walkDir(ctx meta.Context, inode Ino, todo chan _file) {
 	pending := make([]Ino, 1)
 	pending[0] = inode
 	for len(pending) > 0 {
@@ -152,7 +222,7 @@ func (v *VFS) walkDir(inode Ino, todo chan _file) {
 		inode = pending[l]
 		pending = pending[:l]
 		var entries []*meta.Entry
-		r := v.Meta.Readdir(meta.Background, inode, 1, &entries)
+		r := v.Meta.Readdir(ctx, inode, 1, &entries)
 		if r == 0 {
 			for _, f := range entries {
 				name := string(f.Name)
@@ -162,7 +232,10 @@ func (v *VFS) walkDir(inode Ino, todo chan _file) {
 				if f.Attr.Typ == meta.TypeDirectory {
 					pending = append(pending, f.Inode)
 				} else if f.Attr.Typ != meta.TypeSymlink {
-					todo <- _file{f.Inode, f.Attr.Length}
+					_ = sendFile(ctx, todo, _file{f.Inode, f.Attr.Length})
+				}
+				if ctx.Canceled() {
+					return
 				}
 			}
 		} else {
@@ -171,17 +244,74 @@ func (v *VFS) walkDir(inode Ino, todo chan _file) {
 	}
 }
 
-func (v *VFS) fillInode(inode Ino, size uint64) error {
-	var slices []meta.Slice
-	for indx := uint64(0); indx*meta.ChunkSize < size; indx++ {
-		if st := v.Meta.Read(meta.Background, inode, uint32(indx), &slices); st != 0 {
-			return fmt.Errorf("Failed to get slices of inode %d index %d: %d", inode, indx, st)
+type sliceIterator struct {
+	ctx      meta.Context
+	mClient  meta.Meta
+	ino      Ino
+	chunkCnt uint32
+	stat     *CacheResponse
+
+	err            error
+	nextChunkIndex uint32
+	nextSliceIndex uint64
+	slices         []meta.Slice
+}
+
+type sliceHandler func(s meta.Slice) error
+
+func (iter *sliceIterator) hasNext() bool {
+	if iter.ctx.Canceled() {
+		iter.err = iter.ctx.Err()
+		return false
+	}
+
+	for iter.nextSliceIndex >= uint64(len(iter.slices)) {
+		if iter.nextChunkIndex >= iter.chunkCnt {
+			return false
 		}
-		for _, s := range slices {
-			if err := v.Store.FillCache(s.Chunkid, s.Size); err != nil {
-				return fmt.Errorf("Failed to cache inode %d slice %d: %s", inode, s.Chunkid, err)
-			}
+
+		iter.slices = nil
+		iter.nextSliceIndex = 0
+		if st := iter.mClient.Read(iter.ctx, iter.ino, iter.nextChunkIndex, &iter.slices); st != 0 {
+			iter.err = fmt.Errorf("get slices of inode %d index %d error: %d", iter.ino, iter.nextChunkIndex, st)
+			return false
+		}
+		iter.nextChunkIndex++
+	}
+
+	return true
+}
+
+func (iter *sliceIterator) next() meta.Slice {
+	s := iter.slices[iter.nextSliceIndex]
+	iter.nextSliceIndex++
+	return s
+}
+
+func (iter *sliceIterator) Iterate(handler sliceHandler) error {
+	if handler == nil {
+		return fmt.Errorf("handler not set")
+	}
+	for iter.hasNext() {
+		s := iter.next()
+		atomic.AddUint64(&iter.stat.SliceCount, 1)
+		atomic.AddUint64(&iter.stat.TotalBytes, uint64(s.Size))
+		if err := handler(s); err != nil {
+			return fmt.Errorf("inode %d slice %d : %w", iter.ino, s.Id, err)
 		}
 	}
-	return nil
+	return iter.err
+}
+
+func newSliceIterator(ctx meta.Context, mClient meta.Meta, ino Ino, size uint64, stat *CacheResponse) *sliceIterator {
+	return &sliceIterator{
+		ctx:     ctx,
+		mClient: mClient,
+		ino:     ino,
+		stat:    stat,
+
+		nextSliceIndex: 0,
+		nextChunkIndex: 0,
+		chunkCnt:       uint32((size + meta.ChunkSize - 1) / meta.ChunkSize),
+	}
 }

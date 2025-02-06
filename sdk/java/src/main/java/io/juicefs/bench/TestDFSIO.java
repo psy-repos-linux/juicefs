@@ -311,9 +311,9 @@ public class TestDFSIO extends Main.Command {
             "      Number of threads: " + threadsPerMap,
             "Number files per thread: " + filesPerThread,
             "            Total files: " + threadsPerMap * filesPerThread,
-            " Total MBytes processed: " + df.format(TestDFSIO.toMB(sizeProcessed.get())),
-            "Total Throughput mb/sec: " + df.format(TestDFSIO.toMB(sizeProcessed.get()) / TestDFSIO.msToSecs(end - start)),
-            "     Test exec time sec: " + df.format(TestDFSIO.msToSecs(end - start)),
+            " Total MBytes processed: " + df.format(toMB(sizeProcessed.get())),
+            "Total Throughput MB/sec: " + df.format(toMB(sizeProcessed.get()) / msToSecs(end - start)),
+            "     Test exec time sec: " + df.format(msToSecs(end - start)),
             ""};
 
     for (String resultLine : resultLines) {
@@ -584,6 +584,7 @@ public class TestDFSIO extends Main.Command {
           Class<? extends Mapper<Text, LongWritable, Text, Text>> mapperClass,
           Path outputDir) throws IOException {
     JobConf job = new JobConf(config, TestDFSIO.class);
+    job.setBoolean("mapreduce.output.fileoutputformat.compress", false);
 
     FileInputFormat.setInputPaths(job, getControlDir(config));
     job.setInputFormat(SequenceFileInputFormat.class);
@@ -694,17 +695,6 @@ public class TestDFSIO extends Main.Command {
     return System.currentTimeMillis() - tStart;
   }
 
-  /**
-   * Mapper class for random reads.
-   * The mapper chooses a position in the file and reads bufferSize
-   * bytes starting at the chosen position.
-   * It stops after reading the totalSize bytes, specified by -size.
-   * <p>
-   * There are three type of reads.
-   * 1) Random read always chooses a random position to read from: skipSize = 0
-   * 2) Backward read reads file in reverse order                : skipSize < 0
-   * 3) Skip-read skips skipSize bytes after every read          : skipSize > 0
-   */
   public static class RandomReadMapper extends IOStatMapper {
     private ThreadLocalRandom rnd;
     private long fileSize;
