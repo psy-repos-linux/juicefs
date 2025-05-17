@@ -28,6 +28,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/dustin/go-humanize"
 	"hash/fnv"
 	"io"
 	"math/rand"
@@ -787,7 +788,13 @@ func (m *redisMeta) doSyncVolumeStat(ctx Context) error {
 			}
 		}
 	}
-
+	if err := m.scanTrashEntry(ctx, func(_ Ino, length uint64) {
+		used += align4K(length)
+		inodes += 1
+	}); err != nil {
+		return err
+	}
+	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inodes)
 	if err := m.rdb.Set(ctx, m.totalInodesKey(), strconv.FormatInt(inodes, 10), 0).Err(); err != nil {
 		return fmt.Errorf("set total inodes: %s", err)
 	}
@@ -2713,6 +2720,8 @@ func (m *redisMeta) doFindDeletedFiles(ts int64, limit int) (map[Ino]uint64, err
 }
 
 func (m *redisMeta) doCleanupSlices() {
+	start := time.Now()
+	stop := fmt.Errorf("exceeded time limit")
 	_ = m.hscan(Background(), m.sliceRefs(), func(keys []string) error {
 		for i := 0; i < len(keys); i += 2 {
 			key, val := keys[i], keys[i+1]
@@ -2727,6 +2736,9 @@ func (m *redisMeta) doCleanupSlices() {
 				}
 			} else if val == "0" {
 				m.cleanupZeroRef(key)
+			}
+			if time.Since(start) > 50*time.Minute {
+				return stop
 			}
 		}
 		return nil
