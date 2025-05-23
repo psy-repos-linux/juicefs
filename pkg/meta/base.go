@@ -60,6 +60,13 @@ var (
 	inodeNeedPrefetch = uint64(utils.JitterIt(inodeBatch * 0.1)) // Add jitter to reduce probability of txn conflicts
 )
 
+func checkInodeName(name string) syscall.Errno {
+	if len(name) == 0 || strings.ContainsAny(name, "/\x00") {
+		return syscall.EINVAL
+	}
+	return 0
+}
+
 type engine interface {
 	// Get the value of counter name.
 	getCounter(name string) (int64, error)
@@ -346,6 +353,9 @@ func (m *baseMeta) InitMetrics(reg prometheus.Registerer) {
 
 	go func() {
 		for {
+			if m.sessCtx != nil && m.sessCtx.Canceled()  {
+				return
+			}
 			var totalSpace, availSpace, iused, iavail uint64
 			err := m.StatFS(Background(), m.root, &totalSpace, &availSpace, &iused, &iavail)
 			if err == 0 {
@@ -1157,11 +1167,11 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	if m.conf.ReadOnly {
 		return syscall.EROFS
 	}
-	if name == "" {
-		return syscall.ENOENT
-	}
 	if name == "." || name == ".." {
 		return syscall.EEXIST
+	}
+	if errno := checkInodeName(name); errno != 0 {
+		return errno
 	}
 
 	defer m.timeit("Mknod", time.Now())
@@ -1255,8 +1265,8 @@ func (m *baseMeta) Link(ctx Context, inode, parent Ino, name string, attr *Attr)
 	if m.conf.ReadOnly {
 		return syscall.EROFS
 	}
-	if name == "" {
-		return syscall.ENOENT
+	if errno := checkInodeName(name); errno != 0 {
+		return errno
 	}
 	if name == "." || name == ".." {
 		return syscall.EEXIST
@@ -1395,9 +1405,10 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	if m.conf.ReadOnly {
 		return syscall.EROFS
 	}
-	if nameDst == "" {
-		return syscall.ENOENT
+	if errno := checkInodeName(nameDst); errno != 0 {
+		return errno
 	}
+
 	switch flags {
 	case 0, RenameNoReplace, RenameExchange, RenameNoReplace | RenameRestore:
 	case RenameWhiteout, RenameNoReplace | RenameWhiteout:
@@ -2456,6 +2467,7 @@ func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 	if st == syscall.ENOENT {
 		attr := Attr{Typ: TypeDirectory, Nlink: 2, Length: 4 << 10, Parent: TrashInode, Full: true}
 		st = m.en.doMknod(Background(), TrashInode, name, TypeDirectory, 0555, 0, "", trash, &attr)
+		m.en.updateStats(align4K(0), 1)
 	}
 
 	m.Lock()
@@ -2584,6 +2596,28 @@ func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress
 			break
 		}
 	}
+}
+
+func (m *baseMeta) scanTrashEntry(ctx Context, scan func(inode Ino, size uint64)) error {
+	var st syscall.Errno
+	var entries []*Entry
+	if st = m.en.doReaddir(ctx, TrashInode, 1, &entries, -1); st != 0 {
+		return errors.Wrap(st, "read trash")
+	}
+
+	var subEntries []*Entry
+	for _, entry := range entries {
+		scan(entry.Inode, entry.Attr.Length)
+		subEntries = subEntries[:0]
+		if st = m.en.doReaddir(ctx, entry.Inode, 1, &subEntries, -1); st != 0 {
+			logger.Warnf("readdir subEntry %d: %s", entry.Inode, st)
+			continue
+		}
+		for _, se := range subEntries {
+			scan(se.Inode, se.Attr.Length)
+		}
+	}
+	return nil
 }
 
 func (m *baseMeta) scanTrashFiles(ctx Context, scan trashFileScan) error {

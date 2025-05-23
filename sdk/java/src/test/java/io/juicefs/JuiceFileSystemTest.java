@@ -777,7 +777,7 @@ public class JuiceFileSystemTest extends TestCase {
     Configuration newConf = new Configuration(cfg);
 
     newConf.set("juicefs.users", "bar:10000;foo:20000;baz:30000");
-    newConf.set("juicefs.groups", "user:1000:foo,bar;admin:2000:baz");
+    newConf.set("juicefs.groups", "user:10000:foo,bar;admin:2000:baz");
     newConf.set("juicefs.superuser", UserGroupInformation.getCurrentUser().getShortUserName());
 
     FileSystem fooFs = createNewFs(newConf, "foo", new String[]{"nogrp"});
@@ -792,7 +792,7 @@ public class JuiceFileSystemTest extends TestCase {
     newConf.set("juicefs.groups", "user:1001:foo,bar;admin:2001:baz");
     FileSystem newFS = FileSystem.newInstance(newConf);
     assertEquals("20000", newFS.getFileStatus(f).getOwner());
-    assertEquals("1000", newFS.getFileStatus(f).getGroup());
+    assertEquals("10000", newFS.getFileStatus(f).getGroup());
 
     newFS.delete(f, false);
     newFS.close();
@@ -1200,5 +1200,54 @@ public class JuiceFileSystemTest extends TestCase {
     user1Fs.setPermission(d2, new FsPermission((short) 0777));
     user1Fs.delete(d1, true);
     user1Fs.delete(d2, true);
+  }
+
+  public void testSubdir() throws IOException, InterruptedException {
+    Configuration newConf = new Configuration(cfg);
+    newConf.set("fs.defaultFS", "jfs://test/");
+    newConf.set("juicefs.name", "test");
+    newConf.set("juicefs.test.meta", newConf.get("juicefs.dev.meta"));
+    // Test creating a new filesystem with an invalid subdir
+    newConf.set("juicefs.subdir", "nonexistent");
+    try {
+      FileSystem.newInstance(newConf);
+      fail("Creating filesystem should fail because the subdir must be a valid directory");
+    } catch (IOException ignored) {
+    }
+
+    // Test creating a new filesystem with a valid subdir
+    Path subdir = new Path("/test_subdir");
+    fs.delete(subdir, true);
+    fs.mkdirs(subdir);
+    fs.setPermission(subdir, new FsPermission((short) 0777));
+    newConf.set("juicefs.subdir", "/test_subdir");
+    FileSystem newFS = FileSystem.newInstance(newConf);
+
+    // Test file operations within the subdir
+    assertTrue(newFS.mkdirs(new Path("/test_subdir/dir")));
+    newFS.create(new Path("/test_subdir/dir/f")).close();
+    assertTrue(newFS.exists(new Path("/test_subdir/dir/f")));
+
+    // Test file operations not within the subdir
+    Path nonexistent = new Path("/nonexistent");
+    try {
+      newFS.exists(nonexistent);
+      fail("exists should not work because the path is not under the subdir");
+    } catch (AccessControlException e) {
+      assertTrue(e.getMessage().contains("Permission denied"));
+    }
+    try {
+      newFS.mkdirs(nonexistent);
+      fail("mkdirs should not work because the path is not under the subdir");
+    } catch (AccessControlException e) {
+      assertTrue(e.getMessage().contains("Permission denied"));
+    }
+    try {
+      newFS.create(nonexistent);
+      fail("create should not work because the path is not under the subdir");
+    } catch (AccessControlException e) {
+      assertTrue(e.getMessage().contains("Permission denied"));
+    }
+    newFS.close();
   }
 }

@@ -2234,9 +2234,10 @@ func (m *kvMeta) doCleanupSlices() {
 		m.client.gc()
 	}
 	klen := 1 + 8 + 4
+	start := time.Now()
 	_ = m.client.scan(m.fmtKey("K"), func(k, v []byte) bool {
 		if len(k) == klen && len(v) == 8 && parseCounter(v) <= 0 {
-			rb := utils.FromBuffer([]byte(k)[1:])
+			rb := utils.FromBuffer(k[1:])
 			id := rb.Get64()
 			size := rb.Get32()
 			refs := parseCounter(v)
@@ -2244,6 +2245,9 @@ func (m *kvMeta) doCleanupSlices() {
 				m.deleteSlice(id, size)
 			} else {
 				m.cleanupZeroRef(id, size)
+			}
+			if time.Since(start) > 50*time.Minute {
+				return false
 			}
 		}
 		return true
@@ -2662,6 +2666,9 @@ func (m *kvMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno 
 }
 
 func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
+	if len(value) == 0 && m.Name() == "tikv" {
+		return syscall.EINVAL
+	}
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
 		v := tx.get(key)
@@ -2799,6 +2806,12 @@ func (m *kvMeta) doSyncVolumeStat(ctx Context) error {
 		inodes += 1
 	}
 
+	if err := m.scanTrashEntry(ctx, func(_ Ino, length uint64) {
+		used += align4K(length)
+		inodes += 1
+	}); err != nil {
+		return err
+	}
 	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inodes)
 	err = m.setValue(m.counterKey(totalInodes), packCounter(inodes))
 	if err != nil {

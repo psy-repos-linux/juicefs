@@ -19,6 +19,7 @@ package fs
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -113,6 +114,8 @@ func (fs *FileStat) Gid() int         { return int(fs.attr.Gid) }
 func (fs *FileStat) Atime() int64 { return fs.attr.Atime*1000 + int64(fs.attr.Atimensec/1e6) }
 func (fs *FileStat) Mtime() int64 { return fs.attr.Mtime*1000 + int64(fs.attr.Mtimensec/1e6) }
 
+func (fs *FileStat) Attr() *Attr { return fs.attr }
+
 func AttrToFileInfo(inode Ino, attr *Attr) *FileStat {
 	return &FileStat{inode: inode, attr: attr}
 }
@@ -146,6 +149,8 @@ type FileSystem struct {
 	readSizeHistogram     prometheus.Histogram
 	writtenSizeHistogram  prometheus.Histogram
 	opsDurationsHistogram prometheus.Histogram
+
+	registry *prometheus.Registry
 }
 
 type File struct {
@@ -161,9 +166,10 @@ type File struct {
 	wdata    vfs.FileWriter
 	dircache []os.FileInfo
 	entries  []*meta.Entry
+	data     []byte
 }
 
-func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore) (*FileSystem, error) {
+func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore, registry *prometheus.Registry) (*FileSystem, error) {
 	reader := vfs.NewDataReader(conf, m, d)
 	fs := &FileSystem{
 		m:               m,
@@ -192,6 +198,7 @@ func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore) (*FileSyst
 			Help:    "Operations latency distributions.",
 			Buckets: prometheus.ExponentialBuckets(0.0001, 1.5, 30),
 		}),
+		registry: registry,
 	}
 
 	go fs.cleanupCache()
@@ -252,7 +259,7 @@ func (fs *FileSystem) cleanupCache() {
 	}
 }
 
-func (fs *FileSystem) invalidateEntry(parent Ino, name string) {
+func (fs *FileSystem) InvalidateEntry(parent Ino, name string) {
 	fs.cacheM.Lock()
 	defer fs.cacheM.Unlock()
 	es, ok := fs.entries[parent]
@@ -264,7 +271,7 @@ func (fs *FileSystem) invalidateEntry(parent Ino, name string) {
 	}
 }
 
-func (fs *FileSystem) invalidateAttr(ino Ino) {
+func (fs *FileSystem) InvalidateAttr(ino Ino) {
 	fs.cacheM.Lock()
 	defer fs.cacheM.Unlock()
 	delete(fs.attrs, ino)
@@ -398,6 +405,16 @@ func (fs *FileSystem) open(ctx meta.Context, path string, flags uint32, followLi
 	f.info = fi
 	f.fs = fs
 	f.flags = flags
+	switch fi.inode {
+	case vfs.ConfigInode:
+		fs.conf.Format = fs.Meta().GetFormat()
+		fs.conf.Format.RemoveSecret()
+		f.data, _ = json.MarshalIndent(fs.conf, "", " ")
+		f.info.attr.Length = uint64(len(f.data))
+	case vfs.StatsInode:
+		f.data = vfs.CollectMetrics(fs.registry)
+		f.info.attr.Length = uint64(len(f.data))
+	}
 	return
 }
 
@@ -453,7 +470,7 @@ func (fs *FileSystem) Mkdir(ctx meta.Context, p string, mode uint16, umask uint1
 		if fs.conf.DirEntryTimeout > 0 {
 			parent := parentDir(p)
 			if fi, err := fs.resolve(ctx, parentDir(parent), true); err == 0 {
-				fs.invalidateEntry(fi.inode, path.Base(parent))
+				fs.InvalidateEntry(fi.inode, path.Base(parent))
 			}
 		}
 		if fi2, e := fs.resolve(ctx, parentDir(p), true); e != 0 {
@@ -462,7 +479,7 @@ func (fs *FileSystem) Mkdir(ctx meta.Context, p string, mode uint16, umask uint1
 			err = fs.m.Mkdir(ctx, fi2.inode, path.Base(p), mode, umask, 0, &inode, nil)
 		}
 	}
-	fs.invalidateEntry(fi.inode, path.Base(p))
+	fs.InvalidateEntry(fi.inode, path.Base(p))
 	return
 }
 
@@ -516,7 +533,7 @@ func (fs *FileSystem) Delete0(ctx meta.Context, p string, callByUnlink bool) (er
 	} else {
 		err = fs.m.Unlink(ctx, parent.inode, path.Base(p))
 	}
-	fs.invalidateEntry(parent.inode, path.Base(p))
+	fs.InvalidateEntry(parent.inode, path.Base(p))
 	return
 }
 
@@ -529,11 +546,11 @@ func (fs *FileSystem) Rmdir(ctx meta.Context, p string) (err syscall.Errno) {
 		return
 	}
 	err = fs.m.Rmdir(ctx, parent.inode, path.Base(p))
-	fs.invalidateEntry(parent.inode, path.Base(p))
+	fs.InvalidateEntry(parent.inode, path.Base(p))
 	return
 }
 
-func (fs *FileSystem) Rmr(ctx meta.Context, p string, numthreads int) (err syscall.Errno) {
+func (fs *FileSystem) Rmr(ctx meta.Context, p string, skipTrash bool, numthreads int) (err syscall.Errno) {
 	defer trace.StartRegion(context.TODO(), "fs.Rmr").End()
 	l := vfs.NewLogContext(ctx)
 	defer func() { fs.log(l, "Rmr (%s): %s", p, errstr(err)) }()
@@ -541,8 +558,8 @@ func (fs *FileSystem) Rmr(ctx meta.Context, p string, numthreads int) (err sysca
 	if err != 0 {
 		return
 	}
-	err = fs.m.Remove(ctx, parent.inode, path.Base(p), false, numthreads, nil)
-	fs.invalidateEntry(parent.inode, path.Base(p))
+	err = fs.m.Remove(ctx, parent.inode, path.Base(p), skipTrash, numthreads, nil)
+	fs.InvalidateEntry(parent.inode, path.Base(p))
 	return
 }
 
@@ -601,8 +618,8 @@ func (fs *FileSystem) Rename(ctx meta.Context, oldpath string, newpath string, f
 		return err0
 	}
 	err = fs.m.Rename(ctx, oldfi.inode, path.Base(oldpath), newfi.inode, path.Base(newpath), flags, nil, nil)
-	fs.invalidateEntry(oldfi.inode, path.Base(oldpath))
-	fs.invalidateEntry(newfi.inode, path.Base(newpath))
+	fs.InvalidateEntry(oldfi.inode, path.Base(oldpath))
+	fs.InvalidateEntry(newfi.inode, path.Base(newpath))
 	return
 }
 
@@ -620,7 +637,7 @@ func (fs *FileSystem) Link(ctx meta.Context, src string, dst string) (err syscal
 		return
 	}
 	err = fs.m.Link(ctx, fi.inode, pi.inode, path.Base(dst), nil)
-	fs.invalidateEntry(pi.inode, path.Base(dst))
+	fs.InvalidateEntry(pi.inode, path.Base(dst))
 	return
 }
 
@@ -636,7 +653,7 @@ func (fs *FileSystem) Symlink(ctx meta.Context, target string, link string) (err
 		return
 	}
 	err = fs.m.Symlink(ctx, fi.inode, path.Base(link), target, nil, nil)
-	fs.invalidateEntry(fi.inode, path.Base(link))
+	fs.InvalidateEntry(fi.inode, path.Base(link))
 	return
 }
 
@@ -838,6 +855,9 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 }
 
 func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bool, visited map[Ino]struct{}) (fi *FileStat, err syscall.Errno) {
+	if fs.conf.Subdir != "" && !strings.HasPrefix(p, fs.conf.Subdir) {
+		return nil, syscall.EACCES
+	}
 	var inode Ino
 	var attr = &Attr{}
 
@@ -949,7 +969,7 @@ func (fs *FileSystem) Create(ctx meta.Context, p string, mode uint16, umask uint
 		if fs.conf.DirEntryTimeout > 0 {
 			parent := parentDir(p)
 			if fi, err := fs.resolve(ctx, parentDir(parent), true); err == 0 {
-				fs.invalidateEntry(fi.inode, path.Base(parent))
+				fs.InvalidateEntry(fi.inode, path.Base(parent))
 			}
 		}
 		if fi2, e := fs.resolve(ctx, parentDir(p), true); e != 0 {
@@ -968,7 +988,7 @@ func (fs *FileSystem) Create(ctx meta.Context, p string, mode uint16, umask uint
 		f.info = fi
 		f.fs = fs
 	}
-	fs.invalidateEntry(fi.inode, path.Base(p))
+	fs.InvalidateEntry(fi.inode, path.Base(p))
 	return
 }
 
@@ -1089,7 +1109,7 @@ func (f *File) Chmod(ctx meta.Context, mode uint16) (err syscall.Errno) {
 	defer func() { f.fs.log(l, "Chmod (%s,%o): %s", f.path, mode, errstr(err)) }()
 	var attr = Attr{Mode: mode}
 	err = f.fs.m.SetAttr(ctx, f.inode, meta.SetAttrMode, 0, &attr)
-	f.fs.invalidateAttr(f.inode)
+	f.fs.InvalidateAttr(f.inode)
 	return
 }
 
@@ -1106,7 +1126,7 @@ func (f *File) Chown(ctx meta.Context, uid uint32, gid uint32) (err syscall.Errn
 	}
 	var attr = Attr{Uid: uid, Gid: gid}
 	err = f.fs.m.SetAttr(ctx, f.inode, flag, 0, &attr)
-	f.fs.invalidateAttr(f.inode)
+	f.fs.InvalidateAttr(f.inode)
 	return
 }
 
@@ -1130,7 +1150,7 @@ func (f *File) Utime(ctx meta.Context, atime, mtime int64) (err syscall.Errno) {
 	attr.Mtime = mtime / 1000
 	attr.Mtimensec = uint32(mtime%1000) * 1e6
 	err = f.fs.m.SetAttr(ctx, f.inode, flag, 0, &attr)
-	f.fs.invalidateAttr(f.inode)
+	f.fs.InvalidateAttr(f.inode)
 	return
 }
 
@@ -1156,7 +1176,7 @@ func (f *File) Utime2(ctx meta.Context, atimeSec, atimeNSec, mtimeSec, mtimeNsec
 	attr.Mtime = mtimeSec
 	attr.Mtimensec = uint32(mtimeNsec)
 	err = f.fs.m.SetAttr(ctx, f.inode, flag, 0, &attr)
-	f.fs.invalidateAttr(f.inode)
+	f.fs.InvalidateAttr(f.inode)
 	return
 }
 
@@ -1206,6 +1226,10 @@ func (f *File) pread(ctx meta.Context, b []byte, offset int64) (n int, err error
 	}
 	if int64(len(b))+offset > f.info.Size() {
 		b = b[:f.info.Size()-offset]
+	}
+	if f.data != nil {
+		n := copy(b, f.data[offset:])
+		return n, nil
 	}
 	if f.wdata != nil {
 		eno := f.wdata.Flush(ctx)
@@ -1289,7 +1313,7 @@ func (f *File) Truncate(ctx meta.Context, length uint64) (err syscall.Errno) {
 		f.fs.writer.Truncate(f.inode, length)
 		f.fs.reader.Truncate(f.inode, length)
 		f.info.attr.Length = length
-		f.fs.invalidateAttr(f.inode)
+		f.fs.InvalidateAttr(f.inode)
 	}
 	return
 }
@@ -1304,7 +1328,7 @@ func (f *File) Flush(ctx meta.Context) (err syscall.Errno) {
 	l := vfs.NewLogContext(ctx)
 	defer func() { f.fs.log(l, "Flush (%s): %s", f.path, errstr(err)) }()
 	err = f.wdata.Flush(ctx)
-	f.fs.invalidateAttr(f.inode)
+	f.fs.InvalidateAttr(f.inode)
 	return
 }
 
@@ -1318,7 +1342,7 @@ func (f *File) Fsync(ctx meta.Context) (err syscall.Errno) {
 	l := vfs.NewLogContext(ctx)
 	defer func() { f.fs.log(l, "Fsync (%s): %s", f.path, errstr(err)) }()
 	err = f.wdata.Flush(ctx)
-	f.fs.invalidateAttr(f.inode)
+	f.fs.InvalidateAttr(f.inode)
 	return
 }
 
@@ -1338,7 +1362,7 @@ func (f *File) Close(ctx meta.Context) (err syscall.Errno) {
 		}
 		if f.wdata != nil {
 			err = f.wdata.Close(meta.Background())
-			f.fs.invalidateAttr(f.inode)
+			f.fs.InvalidateAttr(f.inode)
 			f.wdata = nil
 		}
 		_ = f.fs.m.Close(ctx, f.inode)

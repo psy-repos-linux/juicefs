@@ -405,6 +405,16 @@ public class JuiceFileSystemImpl extends FileSystem {
     for (String key : bkeys) {
       obj.put(key, Boolean.valueOf(getConf(conf, key, "false")));
     }
+    String subdir = getConf(conf, "subdir", "");
+    if (subdir.equals("/")) {
+      subdir = "";
+    } else if (!subdir.startsWith("/")) {
+      subdir = "/" + subdir;
+    }
+    subdir = subdir.replaceAll("/+$", "");
+    if (!subdir.isEmpty()) {
+      LOG.debug("subdir {} is enabled", subdir);
+    }
     obj.put("bucket", getConf(conf, "bucket", ""));
     obj.put("storageClass", getConf(conf, "storage-class", ""));
     obj.put("readOnly", Boolean.valueOf(getConf(conf, "read-only", "false")));
@@ -421,7 +431,7 @@ public class JuiceFileSystemImpl extends FileSystem {
     obj.put("entryTimeout", getConf(conf, "entry-cache", "0.0"));
     obj.put("dirEntryTimeout", getConf(conf, "dir-entry-cache", "0.0"));
     obj.put("cacheFullBlock", Boolean.valueOf(getConf(conf, "cache-full-block", "true")));
-    obj.put("cacheChecksum", getConf(conf, "verify-cache-checksum", "full"));
+    obj.put("cacheChecksum", getConf(conf, "verify-cache-checksum", "extend"));
     obj.put("cacheEviction", getConf(conf, "cache-eviction", "2-random"));
     obj.put("cacheScanInterval", getConf(conf, "cache-scan-interval", "300"));
     obj.put("cacheExpire", getConf(conf, "cache-expire", "0"));
@@ -448,6 +458,7 @@ public class JuiceFileSystemImpl extends FileSystem {
     obj.put("freeSpace", getConf(conf, "free-space", "0.1"));
     obj.put("accessLog", getConf(conf, "access-log", ""));
     obj.put("superFs", asSuperFs);
+    obj.put("subdir", subdir);
     String jsonConf = obj.toString(2);
     handle = lib.jfs_init(name, jsonConf, user, groupStr, superuser, supergroup);
     if (handle <= 0) {

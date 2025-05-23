@@ -122,8 +122,12 @@ func testStorage(t *testing.T, s ObjectStorage) {
 		}
 	}()
 	all, err := listAll(s, "", "", 10000, true)
+	var dels []string
 	for _, object := range all {
-		_ = s.Delete(object.Key())
+		dels = append(dels, object.Key())
+	}
+	for i := len(dels) - 1; i >= 0; i-- {
+		_ = s.Delete(dels[i])
 	}
 
 	var scPut string
@@ -145,6 +149,9 @@ func testStorage(t *testing.T, s ObjectStorage) {
 	_, err = s.Get("not_exists", 0, -1)
 	if err == nil {
 		t.Fatalf("Get should failed: %s", err)
+	}
+	if _, err := s.Head(string(make([]byte, 8<<10))); err == nil {
+		t.Logf("Head should failed: %s", err)
 	}
 
 	br := []byte("hello")

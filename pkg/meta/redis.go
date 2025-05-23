@@ -44,6 +44,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dustin/go-humanize"
+
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/pkg/errors"
@@ -188,12 +190,15 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 		fopt.MaxRetries = opt.MaxRetries
 		fopt.MinRetryBackoff = opt.MinRetryBackoff
 		fopt.MaxRetryBackoff = opt.MaxRetryBackoff
+		fopt.DialTimeout = opt.DialTimeout
 		fopt.ReadTimeout = opt.ReadTimeout
 		fopt.WriteTimeout = opt.WriteTimeout
+		fopt.PoolFIFO = opt.PoolFIFO               // default: false
 		fopt.PoolSize = opt.PoolSize               // default: GOMAXPROCS * 10
 		fopt.PoolTimeout = opt.PoolTimeout         // default: ReadTimeout + 1 second.
 		fopt.MinIdleConns = opt.MinIdleConns       // disable by default
 		fopt.MaxIdleConns = opt.MaxIdleConns       // disable by default
+		fopt.MaxActiveConns = opt.MaxActiveConns   // default: 0, no limit
 		fopt.ConnMaxIdleTime = opt.ConnMaxIdleTime // default: 30 minutes
 		fopt.ConnMaxLifetime = opt.ConnMaxLifetime // disable by default
 		if conf.ReadOnly {
@@ -221,12 +226,15 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			copt.MaxRetries = opt.MaxRetries
 			copt.MinRetryBackoff = opt.MinRetryBackoff
 			copt.MaxRetryBackoff = opt.MaxRetryBackoff
+			copt.DialTimeout = opt.DialTimeout
 			copt.ReadTimeout = opt.ReadTimeout
 			copt.WriteTimeout = opt.WriteTimeout
+			copt.PoolFIFO = opt.PoolFIFO               // default: false
 			copt.PoolSize = opt.PoolSize               // default: GOMAXPROCS * 10
 			copt.PoolTimeout = opt.PoolTimeout         // default: ReadTimeout + 1 second.
 			copt.MinIdleConns = opt.MinIdleConns       // disable by default
 			copt.MaxIdleConns = opt.MaxIdleConns       // disable by default
+			copt.MaxActiveConns = opt.MaxActiveConns   // default: 0, no limit
 			copt.ConnMaxIdleTime = opt.ConnMaxIdleTime // default: 30 minutes
 			copt.ConnMaxLifetime = opt.ConnMaxLifetime // disable by default
 			if conf.ReadOnly {
@@ -787,7 +795,13 @@ func (m *redisMeta) doSyncVolumeStat(ctx Context) error {
 			}
 		}
 	}
-
+	if err := m.scanTrashEntry(ctx, func(_ Ino, length uint64) {
+		used += align4K(length)
+		inodes += 1
+	}); err != nil {
+		return err
+	}
+	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inodes)
 	if err := m.rdb.Set(ctx, m.totalInodesKey(), strconv.FormatInt(inodes, 10), 0).Err(); err != nil {
 		return fmt.Errorf("set total inodes: %s", err)
 	}
@@ -2713,6 +2727,8 @@ func (m *redisMeta) doFindDeletedFiles(ts int64, limit int) (map[Ino]uint64, err
 }
 
 func (m *redisMeta) doCleanupSlices() {
+	start := time.Now()
+	stop := fmt.Errorf("exceeded time limit")
 	_ = m.hscan(Background(), m.sliceRefs(), func(keys []string) error {
 		for i := 0; i < len(keys); i += 2 {
 			key, val := keys[i], keys[i+1]
@@ -2727,6 +2743,9 @@ func (m *redisMeta) doCleanupSlices() {
 				}
 			} else if val == "0" {
 				m.cleanupZeroRef(key)
+			}
+			if time.Since(start) > 50*time.Minute {
+				return stop
 			}
 		}
 		return nil

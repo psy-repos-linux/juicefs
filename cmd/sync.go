@@ -141,11 +141,11 @@ func selectionFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:  "start-time",
-			Usage: "skip files modified before start-time",
+			Usage: "skip files modified before start-time. example: 2006-01-02 15:04:05",
 		},
 		&cli.StringFlag{
 			Name:  "end-time",
-			Usage: "skip files modified after end-time",
+			Usage: "skip files modified after end-time. example: 2006-01-02 15:04:05",
 		},
 		&cli.Int64Flag{
 			Name:  "limit",
@@ -214,6 +214,10 @@ func syncActionFlags() []cli.Flag {
 		&cli.BoolFlag{
 			Name:  "check-new",
 			Usage: "verify integrity of newly copied files",
+		},
+		&cli.BoolFlag{
+			Name:  "check-change",
+			Usage: "check if source file changes after sync",
 		},
 		&cli.Int64Flag{
 			Name:  "max-failure",

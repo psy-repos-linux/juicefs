@@ -26,6 +26,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/dustin/go-humanize"
 	"io"
 	"net/url"
 	"runtime"
@@ -1218,6 +1219,13 @@ func (m *dbMeta) doSyncVolumeStat(ctx Context) error {
 		return err
 	}
 
+	if err := m.scanTrashEntry(ctx, func(_ Ino, length uint64) {
+		used += align4K(length)
+		inode += 1
+	}); err != nil {
+		return err
+	}
+	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inode)
 	return m.txn(func(s *xorm.Session) error {
 		if _, err := s.Update(&counter{Value: inode}, &counter{Name: totalInodes}); err != nil {
 			return fmt.Errorf("update totalInodes: %s", err)
@@ -3010,8 +3018,12 @@ func (m *dbMeta) doCleanupSlices() {
 		cks = nil
 		return s.Where("refs <= 0").Find(&cks)
 	})
+	start := time.Now()
 	for _, ck := range cks {
 		m.deleteSlice(ck.Id, ck.Size)
+		if time.Since(start) > 50*time.Minute {
+			break
+		}
 	}
 }
 

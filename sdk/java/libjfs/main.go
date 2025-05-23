@@ -52,6 +52,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -183,7 +184,7 @@ type wrapper struct {
 	user       string
 	superuser  string
 	supergroup string
-	isSuperFs  bool
+	conf       javaConf
 }
 
 type logWriter struct {
@@ -234,7 +235,7 @@ func (w *wrapper) withPid(pid int64) meta.Context {
 }
 
 func (w *wrapper) isSuperuser(name string, groups []string) bool {
-	if name == w.superuser || w.isSuperFs {
+	if name == w.superuser || w.conf.SuperFS {
 		return true
 	}
 	for _, g := range groups {
@@ -356,20 +357,25 @@ type javaConf struct {
 	PushLabels        string `json:"pushLabels"`
 	PushGraphite      string `json:"pushGraphite"`
 	Caller            int    `json:"caller"`
+	Subdir            string `json:"subdir"`
 
 	SuperFS bool `json:"superFs,omitempty"`
 }
 
-func getOrCreate(name, user, group, superuser, supergroup string, superFs bool, f func() *fs.FileSystem) int64 {
+func getOrCreate(name, user, group, superuser, supergroup string, conf javaConf, f func() *fs.FileSystem) int64 {
 	fslock.Lock()
 	defer fslock.Unlock()
 	ws := activefs[name]
 	var jfs *fs.FileSystem
 	var m *mapping
-	if len(ws) > 0 {
-		jfs = ws[0].FileSystem
-		m = ws[0].m
-	} else {
+	for _, w := range ws {
+		if reflect.DeepEqual(w.conf, conf) {
+			jfs = w.FileSystem
+			m = w.m
+			break
+		}
+	}
+	if jfs == nil {
 		m = newMapping(name)
 		jfs = f()
 		if jfs == nil {
@@ -381,7 +387,7 @@ func getOrCreate(name, user, group, superuser, supergroup string, superFs bool, 
 		}
 		logger.Infof("JuiceFileSystem created for user:%s group:%s", user, group)
 	}
-	w := &wrapper{jfs, nil, m, user, superuser, supergroup, superFs}
+	w := &wrapper{jfs, nil, m, user, superuser, supergroup, conf}
 	var gs []string
 	if userGroupCache[name] != nil {
 		gs = userGroupCache[name][user]
@@ -395,6 +401,18 @@ func getOrCreate(name, user, group, superuser, supergroup string, superFs bool, 
 		w.ctx = meta.NewContext(uint32(os.Getpid()), 0, []uint32{0})
 	} else {
 		w.ctx = meta.NewContext(uint32(os.Getpid()), w.lookupUid(user), w.lookupGids(group))
+	}
+	// Check if the subdir is valid
+	if conf.Subdir != "" {
+		fi, err := jfs.Stat(w.ctx, conf.Subdir)
+		if err != 0 {
+			logger.Errorf("subdir %s is not valid: %v", conf.Subdir, err)
+			return 0
+		}
+		if !fi.IsDir() {
+			logger.Errorf("subdir %s is not a directory", conf.Subdir)
+			return 0
+		}
 	}
 	activefs[name] = append(ws, w)
 	nextFsHandle = nextFsHandle + 1
@@ -458,16 +476,20 @@ func push2Graphite(graphite string, pushInterVal time.Duration, registry *promet
 }
 
 //export jfs_init
-func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) int64 {
+func jfs_init(cname, cjsonConf, user, group, superuser, supergroup *C.char) int64 {
 	name := C.GoString(cname)
 	debug.SetGCPercent(50)
 	object.UserAgent = "JuiceFS-SDK " + version.Version()
 	var jConf javaConf
-	err := json.Unmarshal([]byte(C.GoString(jsonConf)), &jConf)
+	err := json.Unmarshal([]byte(C.GoString(cjsonConf)), &jConf)
 	if err != nil {
-		logger.Fatalf("invalid json: %s", C.GoString(jsonConf))
+		if os.Getenv("JUICEFS_DEBUG") != "" {
+			logger.Fatalf("invalid json: %s", C.GoString(cjsonConf))
+		} else {
+			logger.Fatalf("invalid json")
+		}
 	}
-	return getOrCreate(name, C.GoString(user), C.GoString(group), C.GoString(superuser), C.GoString(supergroup), jConf.SuperFS, func() *fs.FileSystem {
+	return getOrCreate(name, C.GoString(user), C.GoString(group), C.GoString(superuser), C.GoString(supergroup), jConf, func() *fs.FileSystem {
 		if jConf.Debug || os.Getenv("JUICEFS_DEBUG") != "" {
 			utils.SetLogLevel(logrus.DebugLevel)
 			go func() {
@@ -510,7 +532,8 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) int64
 		}
 		formats[name] = format
 		var registerer prometheus.Registerer
-		if jConf.PushGateway != "" || jConf.PushGraphite != "" {
+		var registry *prometheus.Registry
+		if jConf.PushGateway != "" || jConf.PushGraphite != "" || jConf.Caller == CALLER_PYTHON {
 			commonLabels := prometheus.Labels{"vol_name": name, "mp": "sdk-" + strconv.Itoa(os.Getpid())}
 			if h, err := os.Hostname(); err == nil {
 				commonLabels["instance"] = h
@@ -530,7 +553,7 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) int64
 					commonLabels[splited[0]] = splited[1]
 				}
 			}
-			registry := prometheus.NewRegistry()
+			registry = prometheus.NewRegistry()
 			registerer = prometheus.WrapRegistererWithPrefix("juicefs_", registry)
 			registerer.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 			registerer.MustRegister(collectors.NewGoCollector())
@@ -634,6 +657,7 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) int64
 			DirEntryTimeout: utils.Duration(jConf.DirEntryTimeout),
 			AccessLog:       jConf.AccessLog,
 			FastResolve:     jConf.FastResolve,
+			Subdir:          jConf.Subdir,
 			BackupMeta:      utils.Duration(jConf.BackupMeta),
 			BackupSkipTrash: jConf.BackupSkipTrash,
 		}
@@ -643,7 +667,7 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) int64
 		if !jConf.NoUsageReport && !jConf.NoSession {
 			go usage.ReportUsage(m, "java-sdk "+version.Version())
 		}
-		jfs, err := fs.NewFileSystem(conf, m, store)
+		jfs, err := fs.NewFileSystem(conf, m, store, registry)
 		if err != nil {
 			logger.Errorf("Initialize failed: %s", err)
 			return nil
@@ -711,9 +735,8 @@ func jfs_update_uid_grouping(cname, uidstr *C.char, grouping *C.char) {
 	userGroupCache[name] = userGroups
 	ws := activefs[name]
 	if len(ws) > 0 {
-		m := ws[0].m
-		m.update(uids, gids, false)
 		for _, w := range ws {
+			w.m.update(uids, gids, false)
 			logger.Debugf("Update groups of %s to %s", w.user, strings.Join(userGroups[w.user], ","))
 			if w.isSuperuser(w.user, userGroups[w.user]) {
 				w.ctx = meta.NewContext(uint32(os.Getpid()), 0, []uint32{0})
@@ -937,7 +960,7 @@ func jfs_rmr(pid int64, h int64, cpath *C.char) int32 {
 	if w == nil {
 		return EINVAL
 	}
-	return errno(w.Rmr(w.withPid(pid), C.GoString(cpath), MaxDeletes))
+	return errno(w.Rmr(w.withPid(pid), C.GoString(cpath), false, MaxDeletes))
 }
 
 //export jfs_rename
